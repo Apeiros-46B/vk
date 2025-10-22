@@ -183,6 +183,7 @@ bool Swapchain::recreate(glm::ivec2 sz) {
 
 	this->populate_imgs();
 	this->create_img_views();
+	this->create_semaphores();
 
 	sz = get_size();
 	std::cout << "new swapchain is " << sz.x << "," << sz.y << std::endl;
@@ -224,7 +225,15 @@ void Swapchain::create_img_views() {
 	}
 }
 
-Renderer::Renderer() : win{} {
+void Swapchain::create_semaphores() {
+	this->semaphores.clear();
+	this->semaphores.resize(this->imgs.size());
+	for (auto& semaphore : this->semaphores) {
+		semaphore = this->dev.createSemaphoreUnique({});
+	}
+}
+
+Renderer::Renderer() {
 	VULKAN_HPP_DEFAULT_DISPATCHER.init();
 	auto loader_ver = vk::enumerateInstanceVersion();
 	if (loader_ver < VK_VER) {
@@ -239,7 +248,7 @@ Renderer::Renderer() : win{} {
 	this->inst = vk::createInstanceUnique(inst_cinfo);
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(*this->inst);
 
-	VkSurfaceKHR surf_inner{};
+	auto surf_inner = VkSurfaceKHR{};
 	if (!SDL_Vulkan_CreateSurface(this->win.inner, *this->inst, &surf_inner)) {
 		throw std::runtime_error{SDL_GetError()};
 	}
@@ -269,10 +278,28 @@ Renderer::Renderer() : win{} {
 	
 	this->dev = this->gpu.pdev.createDeviceUnique(dev_cinfo);
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(*this->dev);
+	this->waiter = *this->dev;
 
 	this->qu = dev->getQueue(this->gpu.qu_fam_idx, 0u);
 
 	this->swapchain.emplace(this->gpu, *this->dev, *this->surf, this->win.sz);
 
-	this->waiter = *this->dev;
+	auto cmd_pool_cinfo = vk::CommandPoolCreateInfo{}
+		.setFlags(vk::CommandPoolCreateFlagBits::eResetCommandBuffer)
+		.setQueueFamilyIndex(this->gpu.qu_fam_idx);
+	this->render_cmd_pool = this->dev->createCommandPoolUnique(cmd_pool_cinfo);
+
+	auto cmd_buf_ainfo = vk::CommandBufferAllocateInfo{}
+		.setCommandPool(*this->render_cmd_pool)
+		.setCommandBufferCount(this->render_sync.size())
+		.setLevel(vk::CommandBufferLevel::ePrimary);
+	auto cmd_bufs = this->dev->allocateCommandBuffers(cmd_buf_ainfo);
+	assert(cmd_bufs.size() == this->render_sync.size());
+
+	auto fence_cinfo = vk::FenceCreateInfo{vk::FenceCreateFlagBits::eSignaled};
+	for (size_t i = 0u; i < cmd_bufs.size(); i++) {
+		this->render_sync[i].cmd = cmd_bufs[i];
+		this->render_sync[i].draw = this->dev->createSemaphoreUnique({});
+		this->render_sync[i].drawn = this->dev->createFenceUnique(fence_cinfo);
+	}
 }
