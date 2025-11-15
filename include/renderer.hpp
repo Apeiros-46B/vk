@@ -1,8 +1,7 @@
 #pragma once
 
 #include <array>
-#include <cstddef>
-#include <cstdint>
+#include <optional>
 #include <vector>
 
 #include <glm/ext/vector_int2.hpp>
@@ -11,6 +10,7 @@
 #include <vulkan/vulkan_handles.hpp>
 #include <vulkan/vulkan_structs.hpp>
 
+#include "nums.hpp"
 #include "scoped.hpp"
 
 struct Window {
@@ -26,9 +26,16 @@ struct GPU {
 	vk::PhysicalDevice pdev;
 	vk::PhysicalDeviceProperties props;
 	vk::PhysicalDeviceFeatures feats;
-	uint32_t qu_fam_idx;
+	u32 qu_fam_idx;
 };
 
+struct RenderTarget {
+	vk::Image img;
+	vk::ImageView img_view;
+	vk::Extent2D extent;
+};
+
+// it is the user's responsibility to recreate the swapchain upon receiving false/None
 class Swapchain {
 
 public:
@@ -40,7 +47,12 @@ public:
 	);
 
 	bool recreate(glm::ivec2 sz);
+	bool present(vk::Queue qu);
+	std::optional<RenderTarget> acq_next_img(vk::Semaphore to_sig);
+	vk::ImageMemoryBarrier2 base_barrier() const;
+
 	glm::ivec2 get_size() const;
+	vk::Semaphore get_semaphore() const;
 
 private:
 	void populate_imgs();
@@ -55,6 +67,7 @@ private:
 	std::vector<vk::Image> imgs{};
 	std::vector<vk::UniqueImageView> img_views{};
 	std::vector<vk::UniqueSemaphore> semaphores{};
+	std::optional<usz> img_idx{};
 
 };
 
@@ -62,6 +75,7 @@ class Renderer {
 
 public:
 	explicit Renderer();
+	void draw();
 
 private:
 	struct RenderSync {
@@ -82,7 +96,7 @@ private:
 
 	vk::UniqueCommandPool render_cmd_pool;
 	std::array<RenderSync, 2> render_sync{};
-	size_t cur_frame{0};
+	usz img_idx{0};
 
 	// when destroying renderer, this waits until dev idle before destroying preceding fields
 	ScopedWaiter waiter;

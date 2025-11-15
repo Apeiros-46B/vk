@@ -1,9 +1,9 @@
 #include "renderer.hpp"
 
 #include <algorithm>
-#include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <limits>
 #include <optional>
 #include <stdexcept>
 
@@ -20,11 +20,13 @@
 #include <vulkan/vulkan_hpp_macros.hpp>
 #include <vulkan/vulkan_structs.hpp>
 
+#include "nums.hpp"
+
 VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
 
 // use vulkan 1.3.0
 constexpr auto VK_VER = vk::makeApiVersion(0, 1, 3, 0);
-constexpr auto MIN_IMGS = 3u;
+constexpr u32 MIN_IMGS = 3u;
 
 static constexpr auto QU_PRIOS = std::array{1.0f};
 static constexpr auto DEV_EXTS = std::array{VK_KHR_SWAPCHAIN_EXTENSION_NAME};
@@ -32,8 +34,12 @@ static constexpr auto SRGB_FMTS = std::array{
 	vk::Format::eR8G8B8A8Srgb,
 	vk::Format::eB8G8R8A8Srgb,
 };
+static constexpr auto SUBRESOURCE_RANGE = vk::ImageSubresourceRange{}
+	.setAspectMask(vk::ImageAspectFlagBits::eColor)
+	.setLayerCount(1)
+	.setLayerCount(1);
 
-void require_success(vk::Result res, const char* msg) {
+static void require_success(vk::Result res, const char* msg) {
 	if (res != vk::Result::eSuccess) {
 		throw std::runtime_error{msg};
 	}
@@ -51,7 +57,7 @@ Window::Window() {
 
 	SDL_Vulkan_GetDrawableSize(this->inner, &this->sz.x, &this->sz.y);
 
-	auto ext_count = 0u;
+	u32 ext_count = 0u;
 	SDL_Vulkan_GetInstanceExtensions(this->inner, &ext_count, nullptr);
 	this->required_exts.resize(ext_count);
 	SDL_Vulkan_GetInstanceExtensions(this->inner, &ext_count, this->required_exts.data());
@@ -60,58 +66,6 @@ Window::Window() {
 Window::~Window() {
 	SDL_DestroyWindow(this->inner);
 	SDL_Quit();
-}
-
-static GPU find_gpu(vk::Instance inst, vk::SurfaceKHR surf) {
-	auto fallback = std::optional<GPU>{};
-
-	// TODO: extend selection mechanism to use quantitative scoring based on vram
-	for (auto pdev : inst.enumeratePhysicalDevices()) {
-		auto props = pdev.getProperties();
-		if (props.apiVersion < VK_VER) continue;
-
-		auto swapchain_supported = false;
-		for (auto const props : pdev.enumerateDeviceExtensionProperties()) {
-			if (std::strcmp(props.extensionName.data(), VK_KHR_SWAPCHAIN_EXTENSION_NAME) == 0) {
-				swapchain_supported = true;
-				break;
-			}
-		}
-		if (!swapchain_supported) continue;
-
-		// TODO: multi queue
-		auto set_qu_fam = false;
-		auto quflags = vk::QueueFlagBits::eGraphics | vk::QueueFlagBits::eTransfer;
-		auto qu_fam_idx = 0u;
-		for (auto const qu_fam : pdev.getQueueFamilyProperties()) {
-			if ((qu_fam.queueFlags & quflags) == quflags) {
-				set_qu_fam = true;
-				break;
-			}
-			qu_fam_idx++;
-		}
-		if (!set_qu_fam) continue;
-
-		auto can_present = pdev.getSurfaceSupportKHR(qu_fam_idx, surf) == vk::True;
-		if (!can_present) continue;
-
-		auto candidate = GPU{
-			.pdev = pdev,
-			.props = props,
-			.feats = pdev.getFeatures(),
-			.qu_fam_idx = qu_fam_idx,
-		};
-		if (props.deviceType == vk::PhysicalDeviceType::eDiscreteGpu) {
-			return candidate;
-		}
-		fallback = candidate; // We might find a discrete GPU later
-	}
-
-	if (fallback.has_value()) {
-		return fallback.value();
-	}
-
-	throw std::runtime_error{"No suitable Vulkan devices found."};
 }
 
 static vk::SurfaceFormatKHR get_surf_fmt(std::vector<vk::SurfaceFormatKHR> supported) {
@@ -127,20 +81,32 @@ static vk::SurfaceFormatKHR get_surf_fmt(std::vector<vk::SurfaceFormatKHR> suppo
 }
 
 static vk::Extent2D get_img_extent(vk::SurfaceCapabilitiesKHR& caps, glm::uvec2 sz) {
-	auto large = 0xffff'ffff;
+	u32 large = 0xffff'ffff;
 	if (caps.currentExtent.width < large && caps.currentExtent.height < large) {
 		return caps.currentExtent;
 	}
-	auto x = std::clamp(sz.x, caps.minImageExtent.width, caps.maxImageExtent.width);
-	auto y = std::clamp(sz.y, caps.minImageExtent.height, caps.maxImageExtent.height);
+	u32 x = std::clamp(sz.x, caps.minImageExtent.width, caps.maxImageExtent.width);
+	u32 y = std::clamp(sz.y, caps.minImageExtent.height, caps.maxImageExtent.height);
 	return vk::Extent2D{x, y};
 }
 
-static uint32_t get_img_count(vk::SurfaceCapabilitiesKHR& caps) {
+static u32 get_img_count(vk::SurfaceCapabilitiesKHR& caps) {
 	if (caps.maxImageCount < caps.minImageCount) {
 		return std::max(MIN_IMGS, caps.minImageCount);
 	}
 	return std::clamp(MIN_IMGS, caps.minImageCount, caps.maxImageCount);
+}
+
+static bool needs_recreation(vk::Result res) {
+	switch (res) {
+		case vk::Result::eSuccess:
+		case vk::Result::eSuboptimalKHR:
+			return false;
+		case vk::Result::eErrorOutOfDateKHR:
+			return true;
+		default:
+			throw std::runtime_error{"Swapchain error"};
+	}
 }
 
 Swapchain::Swapchain(
@@ -191,12 +157,54 @@ bool Swapchain::recreate(glm::ivec2 sz) {
 	return true;
 }
 
+bool Swapchain::present(vk::Queue qu) {
+	u32 img_idx = this->img_idx.value();
+	auto wait_semaphore = *this->semaphores.at(img_idx);
+	auto present_info = vk::PresentInfoKHR{}
+		.setSwapchains(*this->inner)
+		.setImageIndices(img_idx)
+		.setWaitSemaphores(wait_semaphore);
+	auto res = qu.presentKHR(&present_info);
+	this->img_idx.reset();
+	return !needs_recreation(res);
+}
+
+std::optional<RenderTarget> Swapchain::acq_next_img(vk::Semaphore to_sig) {
+	assert(!this->img_idx.has_value());
+	u32 img_idx = 0u;
+	auto res = this->dev.acquireNextImageKHR(
+		*this->inner,
+		std::numeric_limits<u64>::max(),
+		to_sig,
+		{},
+		&img_idx
+	);
+	if (needs_recreation(res)) {
+		return {};
+	}
+
+	this->img_idx = img_idx;
+	return RenderTarget{
+		.img = this->imgs.at(*this->img_idx),
+		.img_view = *this->img_views.at(*this->img_idx),
+		.extent = this->cinfo.imageExtent,
+	};
+}
+
+vk::ImageMemoryBarrier2 Swapchain::base_barrier() const {
+	return vk::ImageMemoryBarrier2{}
+		.setImage(this->imgs.at(this->img_idx.value()))
+		.setSubresourceRange(SUBRESOURCE_RANGE)
+		.setSrcQueueFamilyIndex(this->gpu.qu_fam_idx)
+		.setDstQueueFamilyIndex(this->gpu.qu_fam_idx);
+}
+
 glm::ivec2 Swapchain::get_size() const {
 	return {this->cinfo.imageExtent.width, this->cinfo.imageExtent.height};
 }
 
 void Swapchain::populate_imgs() {
-	uint32_t img_count;
+	u32 img_count;
 	vk::Result res;
 
 	res = this->dev.getSwapchainImagesKHR(*this->inner, &img_count, nullptr);
@@ -231,6 +239,62 @@ void Swapchain::create_semaphores() {
 	for (auto& semaphore : this->semaphores) {
 		semaphore = this->dev.createSemaphoreUnique({});
 	}
+}
+
+vk::Semaphore Swapchain::get_semaphore() const {
+	return *this->semaphores.at(this->img_idx.value());
+}
+
+static GPU find_gpu(vk::Instance inst, vk::SurfaceKHR surf) {
+	auto fallback = std::optional<GPU>{};
+
+	// TODO: extend selection mechanism to use quantitative scoring based on vram
+	for (auto pdev : inst.enumeratePhysicalDevices()) {
+		auto props = pdev.getProperties();
+		if (props.apiVersion < VK_VER) continue;
+
+		bool swapchain_supported = false;
+		for (auto const props : pdev.enumerateDeviceExtensionProperties()) {
+			if (std::strcmp(props.extensionName.data(), VK_KHR_SWAPCHAIN_EXTENSION_NAME) == 0) {
+				swapchain_supported = true;
+				break;
+			}
+		}
+		if (!swapchain_supported) continue;
+
+		// TODO: multi queue
+		bool set_qu_fam = false;
+		auto quflags = vk::QueueFlagBits::eGraphics | vk::QueueFlagBits::eTransfer;
+		u32 qu_fam_idx = 0u;
+		for (auto const qu_fam : pdev.getQueueFamilyProperties()) {
+			if ((qu_fam.queueFlags & quflags) == quflags) {
+				set_qu_fam = true;
+				break;
+			}
+			qu_fam_idx++;
+		}
+		if (!set_qu_fam) continue;
+
+		bool can_present = pdev.getSurfaceSupportKHR(qu_fam_idx, surf) == vk::True;
+		if (!can_present) continue;
+
+		auto candidate = GPU{
+			.pdev = pdev,
+			.props = props,
+			.feats = pdev.getFeatures(),
+			.qu_fam_idx = qu_fam_idx,
+		};
+		if (props.deviceType == vk::PhysicalDeviceType::eDiscreteGpu) {
+			return candidate;
+		}
+		fallback = candidate; // We might find a discrete GPU later
+	}
+
+	if (fallback.has_value()) {
+		return fallback.value();
+	}
+
+	throw std::runtime_error{"No suitable Vulkan devices found."};
 }
 
 Renderer::Renderer() {
@@ -284,6 +348,7 @@ Renderer::Renderer() {
 
 	this->swapchain.emplace(this->gpu, *this->dev, *this->surf, this->win.sz);
 
+	// create_render_sync
 	auto cmd_pool_cinfo = vk::CommandPoolCreateInfo{}
 		.setFlags(vk::CommandPoolCreateFlagBits::eResetCommandBuffer)
 		.setQueueFamilyIndex(this->gpu.qu_fam_idx);
@@ -297,9 +362,13 @@ Renderer::Renderer() {
 	assert(cmd_bufs.size() == this->render_sync.size());
 
 	auto fence_cinfo = vk::FenceCreateInfo{vk::FenceCreateFlagBits::eSignaled};
-	for (size_t i = 0u; i < cmd_bufs.size(); i++) {
+	for (usz i = 0u; i < cmd_bufs.size(); i++) {
 		this->render_sync[i].cmd = cmd_bufs[i];
 		this->render_sync[i].draw = this->dev->createSemaphoreUnique({});
 		this->render_sync[i].drawn = this->dev->createFenceUnique(fence_cinfo);
 	}
+}
+
+void Renderer::draw() {
+
 }

@@ -1,0 +1,4 @@
+- use `auto` for variables except when doing conversions or if it's a primitive type
+  - use numbers from `nums.hpp`
+  - explicitly mark floats with `f` suffix and unsigned ints with `u` suffix
+- explicit `this->`
