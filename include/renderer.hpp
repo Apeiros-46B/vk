@@ -10,8 +10,24 @@
 #include <vulkan/vulkan_handles.hpp>
 #include <vulkan/vulkan_structs.hpp>
 
+#include "arena.hpp"
 #include "nums.hpp"
 #include "scoped.hpp"
+
+struct DrawCommand {
+	// TODO
+};
+
+struct FramePacket {
+	flt dt;
+	std::span<DrawCommand> commands;
+};
+
+struct FrameContext {
+	Arena arena;
+	FramePacket* packet = nullptr;
+	FrameContext() : arena(1024 * 1024) {}
+};
 
 struct Window {
 	SDL_Window* inner;
@@ -75,7 +91,7 @@ class Renderer {
 
 public:
 	explicit Renderer();
-	void draw();
+	void draw(FramePacket* packet);
 
 private:
 	struct RenderSync {
