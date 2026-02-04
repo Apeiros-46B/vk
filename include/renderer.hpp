@@ -11,8 +11,8 @@
 #include <vulkan/vulkan_structs.hpp>
 
 #include "arena.hpp"
-#include "nums.hpp"
 #include "scoped.hpp"
+#include "sugar.hpp"
 
 struct DrawCommand {
 	// TODO
@@ -83,7 +83,7 @@ private:
 	std::vector<vk::Image> imgs{};
 	std::vector<vk::UniqueImageView> img_views{};
 	std::vector<vk::UniqueSemaphore> semaphores{};
-	std::optional<usz> img_idx{};
+	std::optional<u32> img_idx{};
 
 };
 
@@ -96,7 +96,8 @@ public:
 private:
 	struct RenderSync {
 		vk::CommandBuffer cmd;
-		vk::UniqueSemaphore draw;
+		vk::UniqueSemaphore available;
+		vk::UniqueSemaphore finished;
 		vk::UniqueFence drawn;
 	};
 
@@ -112,7 +113,7 @@ private:
 
 	vk::UniqueCommandPool render_cmd_pool;
 	std::array<RenderSync, 2> render_sync{};
-	usz img_idx{0};
+	u64 img_idx{0};
 
 	// when destroying renderer, this waits until dev idle before destroying preceding fields
 	ScopedWaiter waiter;

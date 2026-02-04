@@ -21,7 +21,7 @@
 #include <vulkan/vulkan_hpp_macros.hpp>
 #include <vulkan/vulkan_structs.hpp>
 
-#include "nums.hpp"
+#include "sugar.hpp"
 
 VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
 
@@ -42,17 +42,17 @@ static constexpr auto SUBRESOURCE_RANGE = vk::ImageSubresourceRange{}
 
 static void require_success(vk::Result res, const char* msg) {
 	if (res != vk::Result::eSuccess) {
-		throw std::runtime_error{msg};
+		throw std::runtime_error(msg);
 	}
 }
 
 Window::Window() {
 	if (SDL_Init(SDL_INIT_VIDEO) != 0) {
-		throw std::runtime_error{SDL_GetError()};
+		throw std::runtime_error(SDL_GetError());
 	}
 	auto ptr = SDL_CreateWindow("vk", -1, -1, 800, 600, SDL_WINDOW_SHOWN | SDL_WINDOW_VULKAN);
 	if (ptr == nullptr) {
-		throw std::runtime_error{SDL_GetError()};
+		throw std::runtime_error(SDL_GetError());
 	}
 	this->inner = ptr;
 
@@ -69,7 +69,7 @@ Window::~Window() {
 	SDL_Quit();
 }
 
-static bool needs_recreation(vk::Result res) {
+static auto needs_recreation(vk::Result res) -> bool {
 	switch (res) {
 		case vk::Result::eSuccess:
 		case vk::Result::eSuboptimalKHR:
@@ -77,7 +77,7 @@ static bool needs_recreation(vk::Result res) {
 		case vk::Result::eErrorOutOfDateKHR:
 			return true;
 		default:
-			throw std::runtime_error{"Swapchain error"};
+			throw std::runtime_error("Swapchain error");
 	}
 }
 
@@ -88,43 +88,48 @@ Swapchain::Swapchain(
 	glm::ivec2 sz
 ) : gpu{gpu}, dev{dev}, surf{surf} {
 	if (!this->recreate(sz)) {
-		throw std::runtime_error{"Failed to initialize Vulkan swapchain"};
+		throw std::runtime_error("Failed to initialize Vulkan swapchain");
 	}
 }
 
-bool Swapchain::recreate(glm::ivec2 sz) {
+auto Swapchain::recreate(glm::ivec2 sz) -> bool {
 	if (sz.x <= 0 || sz.y <= 0) return false;
 
 	this->dev.waitIdle();
-	vkb::SwapchainBuilder builder{this->gpu.pdev, this->dev, this->surf};
-	auto vkb_swap_ret = builder
+	auto vkb_swap_ret = vkb::SwapchainBuilder{ this->gpu.pdev, this->dev, this->surf }
 		.set_desired_extent(sz.x, sz.y)
-		.set_desired_format(vk::SurfaceFormatKHR{vk::Format::eR8G8B8A8Srgb, vk::ColorSpaceKHR::eVkColorspaceSrgbNonlinear})
+		.set_desired_format(vk::SurfaceFormatKHR{
+			vk::Format::eR8G8B8A8Srgb,
+			vk::ColorSpaceKHR::eVkColorspaceSrgbNonlinear,
+		})
 		.set_desired_present_mode(VK_PRESENT_MODE_FIFO_KHR)
 		.set_desired_min_image_count(MIN_IMGS)
 		.set_old_swapchain(this->inner ? *this->inner : VK_NULL_HANDLE)
 		.build();
 
-	if (!vkb_swap_ret) {
-		std::cerr << "Swapchain recreation failed: " << vkb_swap_ret.error().message() << std::endl;
+	if (!vkb_swap_ret.has_value()) {
+		std::cerr << "recreation failed: " << vkb_swap_ret.error().message() << std::endl;
 		return false;
 	}
-
-	vkb::Swapchain vkb_swap = vkb_swap_ret.value();
+	auto vkb_swap = vkb_swap_ret.value();
 
 	this->inner = vk::UniqueSwapchainKHR{vkb_swap.swapchain, this->dev};
 	this->cinfo.imageExtent = vkb_swap.extent;
 	this->cinfo.imageFormat = vk::Format(vkb_swap.image_format);
 
 	auto images = vkb_swap.get_images();
-	if (!images) throw std::runtime_error("Failed to get swapchain images");
+	if (!images.has_value()) {
+		throw std::runtime_error("Failed to get swapchain images");
+	};
 	this->imgs.resize(images->size());
 	std::transform(images->begin(), images->end(), this->imgs.begin(),
 		[](VkImage img) { return vk::Image(img); }
 	);
 
 	auto views = vkb_swap.get_image_views();
-	if (!views) throw std::runtime_error("Failed to get swapchain image views");
+	if (!views.has_value()) {
+		throw std::runtime_error("Failed to get swapchain image views");
+	}
 
 	this->img_views.clear();
 	for (auto v : views.value()) {
@@ -139,10 +144,12 @@ bool Swapchain::recreate(glm::ivec2 sz) {
 	return true;
 }
 
-bool Swapchain::present(vk::Queue qu) {
-	if (!this->img_idx.has_value()) return true; // Nothing to present
+auto Swapchain::present(vk::Queue qu) -> bool {
+	if (!this->img_idx.has_value()) {
+		return true;
+	}
 
-	u32 img_idx = this->img_idx.value();
+	auto img_idx = this->img_idx.value();
 	auto wait_semaphore = *this->semaphores.at(img_idx);
 	auto present_info = vk::PresentInfoKHR{}
 		.setSwapchains(*this->inner)
@@ -160,7 +167,7 @@ bool Swapchain::present(vk::Queue qu) {
 	return !needs_recreation(res);
 }
 
-std::optional<RenderTarget> Swapchain::acq_next_img(vk::Semaphore to_sig) {
+auto Swapchain::acq_next_img(vk::Semaphore to_sig) -> std::optional<RenderTarget> {
 	assert(!this->img_idx.has_value());
 	u32 img_idx = 0u;
 
@@ -182,26 +189,26 @@ std::optional<RenderTarget> Swapchain::acq_next_img(vk::Semaphore to_sig) {
 	}
 
 	this->img_idx = img_idx;
-	return RenderTarget{
+	return RenderTarget {
 		.img = this->imgs.at(*this->img_idx),
 		.img_view = *this->img_views.at(*this->img_idx),
 		.extent = this->cinfo.imageExtent,
 	};
 }
 
-vk::ImageMemoryBarrier2 Swapchain::base_barrier() const {
+auto Swapchain::base_barrier() const -> vk::ImageMemoryBarrier2 {
 	return vk::ImageMemoryBarrier2{}
-	.setImage(this->imgs.at(this->img_idx.value()))
-	.setSubresourceRange(SUBRESOURCE_RANGE)
-	.setSrcQueueFamilyIndex(this->gpu.qu_fam_idx)
-	.setDstQueueFamilyIndex(this->gpu.qu_fam_idx);
+		.setImage(this->imgs.at(this->img_idx.value()))
+		.setSubresourceRange(SUBRESOURCE_RANGE)
+		.setSrcQueueFamilyIndex(this->gpu.qu_fam_idx)
+		.setDstQueueFamilyIndex(this->gpu.qu_fam_idx);
 }
 
-glm::ivec2 Swapchain::get_size() const {
+auto Swapchain::get_size() const -> glm::ivec2 {
 	return {this->cinfo.imageExtent.width, this->cinfo.imageExtent.height};
 }
 
-void Swapchain::create_semaphores() {
+auto Swapchain::create_semaphores() -> void {
 	this->semaphores.clear();
 	this->semaphores.resize(this->imgs.size());
 	for (auto& semaphore : this->semaphores) {
@@ -209,7 +216,7 @@ void Swapchain::create_semaphores() {
 	}
 }
 
-vk::Semaphore Swapchain::get_semaphore() const {
+auto Swapchain::get_semaphore() const -> vk::Semaphore {
 	return *this->semaphores.at(this->img_idx.value());
 }
 
@@ -226,7 +233,9 @@ Renderer::Renderer() {
 	}
 
 	auto vkb_inst_ret = inst_builder.build();
-	if (!vkb_inst_ret) throw std::runtime_error(vkb_inst_ret.error().message());
+	if (!vkb_inst_ret.has_value()) {
+		throw std::runtime_error(vkb_inst_ret.error().message());
+	}
 
 	auto vkb_inst = vkb_inst_ret.value();
 
@@ -235,7 +244,7 @@ Renderer::Renderer() {
 
 	auto surf_inner = VkSurfaceKHR{};
 	if (!SDL_Vulkan_CreateSurface(this->win.inner, *this->inst, &surf_inner)) {
-		throw std::runtime_error{SDL_GetError()};
+		throw std::runtime_error(SDL_GetError());
 	}
 	this->surf = vk::UniqueSurfaceKHR{surf_inner, *this->inst};
 
@@ -259,12 +268,8 @@ Renderer::Renderer() {
 	auto vkb_phys = phys_ret.value();
 
 	auto dev_ret = vkb::DeviceBuilder{vkb_phys}.build();
-	if (!dev_ret) throw std::runtime_error(dev_ret.error().message());
-	auto vkb_dev = dev_ret.value();
-
+	if (!dev_ret) throw std::runtime_error(dev_ret.error().message()); auto vkb_dev = dev_ret.value();
 	this->dev = vk::UniqueDevice{vkb_dev.device};
-	VULKAN_HPP_DEFAULT_DISPATCHER.init(*this->dev);
-
 	this->waiter = *this->dev;
 
 	auto graphics_queue_ret = vkb_dev.get_queue(vkb::QueueType::graphics);
@@ -274,7 +279,7 @@ Renderer::Renderer() {
 	auto queue_fam_ret = vkb_dev.get_queue_index(vkb::QueueType::graphics);
 	if (!queue_fam_ret) throw std::runtime_error("No graphics queue found");
 
-	this->gpu = GPU{
+	this->gpu = GPU {
 		.pdev = vkb_phys.physical_device,
 		.props = vkb_phys.properties,
 		.feats = vkb_phys.features,
@@ -298,11 +303,29 @@ Renderer::Renderer() {
 	auto fence_cinfo = vk::FenceCreateInfo{vk::FenceCreateFlagBits::eSignaled};
 	for (size_t i = 0u; i < cmd_bufs.size(); i++) {
 		this->render_sync[i].cmd = cmd_bufs[i];
-		this->render_sync[i].draw = this->dev->createSemaphoreUnique({});
+		this->render_sync[i].available = this->dev->createSemaphoreUnique({});
+		this->render_sync[i].finished = this->dev->createSemaphoreUnique({});
 		this->render_sync[i].drawn = this->dev->createFenceUnique(fence_cinfo);
 	}
 }
 
 void Renderer::draw(FramePacket* packet) {
 	std::cout << packet->dt << std::endl;
+
+	auto i = this->img_idx % this->render_sync.size();
+	auto sync = &this->render_sync[i];
+
+	auto res = this->dev->waitForFences(1, &sync->drawn.get(), true, 1'000'000'000);
+	require_success(res, "wait for fence failed");
+
+	auto img = this->swapchain->acq_next_img(this->render_sync[i].available.get());
+	if (!img.has_value()) {
+		// todo: get window size here
+		this->swapchain->recreate();
+		goto end_frame;
+	}
+
+end_frame:
+	this->img_idx++;
+
 }

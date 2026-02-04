@@ -6,15 +6,22 @@
 #include <SDL_events.h>
 
 #include "arena.hpp"
-#include "nums.hpp"
 #include "renderer.hpp"
+#include "sugar.hpp"
 
 boost::lockfree::spsc_queue<FrameContext*, boost::lockfree::capacity<4>> render_queue;
 boost::lockfree::spsc_queue<FrameContext*, boost::lockfree::capacity<4>> free_queue;
 
 std::atomic<bool> is_running{true};
 
-void render_loop(Renderer& renderer) {
+template<typename T, typename... Options>
+void delete_all(boost::lockfree::spsc_queue<T*, Options...>& queue) {
+	queue.consume_all([](T* ptr) { delete ptr; });
+}
+
+void render_loop() {
+	auto renderer = Renderer();
+
 	while (is_running) {
 		FrameContext* ctx = nullptr;
 		if (render_queue.pop(ctx)) {
@@ -30,19 +37,15 @@ void render_loop(Renderer& renderer) {
 		}
 	}
 
-	// drain queue to prevent memory leaks on exit
-	render_queue.consume_all([](FrameContext* p) { delete p; });
+	delete_all(render_queue);
 }
 
 int main() {
-	auto renderer = Renderer{};
-	std::thread render_thread(render_loop, std::ref(renderer));
-
-	for (int i = 0; i < 3; i++) {
+	auto render_thread = std::thread(render_loop);
+	for (usz i = 0; i < 3; i++) {
 		free_queue.push(new FrameContext());
 	}
 
-	// main loop
 	SDL_Event ev;
 	auto t_prev = std::chrono::steady_clock::now();
 
@@ -74,6 +77,12 @@ int main() {
 	}
 
 quit:
+	is_running.store(false);
+	if (render_thread.joinable()) {
+		render_thread.join();
+	}
+	delete_all(free_queue);
+
 	std::cout << "Exiting" << std::endl;
 
 }
