@@ -1,11 +1,11 @@
+#include <SDL_video.h>
 #include <chrono>
 #include <iostream>
 #include <thread>
 
 #include <boost/lockfree/spsc_queue.hpp>
-#include <SDL_events.h>
+#include <SDL.h>
 
-#include "arena.hpp"
 #include "renderer.hpp"
 #include "sugar.hpp"
 
@@ -19,8 +19,8 @@ void delete_all(boost::lockfree::spsc_queue<T*, Options...>& queue) {
 	queue.consume_all([](T* ptr) { delete ptr; });
 }
 
-void render_loop() {
-	auto renderer = Renderer();
+void render_loop(Window* win) {
+	auto renderer = Renderer(win);
 
 	while (is_running) {
 		FrameContext* ctx = nullptr;
@@ -41,18 +41,29 @@ void render_loop() {
 }
 
 int main() {
-	auto render_thread = std::thread(render_loop);
+	auto win = Window();
+
+	auto render_thread = std::thread(render_loop, &win);
 	for (usz i = 0; i < 3; i++) {
 		free_queue.push(new FrameContext());
 	}
 
 	SDL_Event ev;
 	auto t_prev = std::chrono::steady_clock::now();
+	auto win_sz = win.sz;
 
 	while (true) {
 		while (SDL_PollEvent(&ev)) {
 			switch (ev.type) {
 				case SDL_QUIT: goto quit;
+				case SDL_WINDOWEVENT:
+					switch (ev.window.type) {
+						case SDL_WINDOWEVENT_RESIZED:
+							SDL_GetWindowSize(win.inner, &win_sz.x, &win_sz.y);
+							break;
+						default: break;
+					}
+					break;
 				default: break;
 			}
 		}
@@ -70,7 +81,9 @@ int main() {
 		ctx->arena.reset();
 
 		ctx->packet = ctx->arena.alloc<FramePacket>();
+		ctx->packet->t = t_now.time_since_epoch().count();
 		ctx->packet->dt = dt.count();
+		ctx->packet->win_sz = win_sz;
 		// TODO: draw commands
 
 		render_queue.push(ctx);

@@ -1,11 +1,12 @@
 #pragma once
 
+#include <SDL_video.h>
 #include <array>
+#include <glm/ext/vector_uint2.hpp>
 #include <optional>
 #include <vector>
 
 #include <glm/ext/vector_int2.hpp>
-#include <SDL_video.h>
 #include <vulkan/vulkan.hpp>
 #include <vulkan/vulkan_handles.hpp>
 #include <vulkan/vulkan_structs.hpp>
@@ -19,7 +20,9 @@ struct DrawCommand {
 };
 
 struct FramePacket {
+	flt t;
 	flt dt;
+	glm::ivec2 win_sz;
 	std::span<DrawCommand> commands;
 };
 
@@ -62,18 +65,15 @@ public:
 		glm::ivec2 sz
 	);
 
-	bool recreate(glm::ivec2 sz);
-	bool present(vk::Queue qu);
-	std::optional<RenderTarget> acq_next_img(vk::Semaphore to_sig);
-	vk::ImageMemoryBarrier2 base_barrier() const;
-
-	glm::ivec2 get_size() const;
-	vk::Semaphore get_semaphore() const;
+	auto recreate(glm::ivec2 sz) -> bool;
+	auto present(vk::Queue qu, vk::Semaphore to_wait) -> bool;
+	auto acq_next_img(vk::Semaphore to_sig) -> std::optional<RenderTarget>;
+	auto base_barrier() const -> vk::ImageMemoryBarrier2;
+	auto get_size() const -> glm::ivec2;
 
 private:
-	void populate_imgs();
-	void create_img_views();
-	void create_semaphores();
+	auto populate_imgs() -> void;
+	auto create_img_views() -> void;
 
 	GPU gpu;
 	vk::Device dev;
@@ -82,7 +82,6 @@ private:
 	vk::UniqueSwapchainKHR inner;
 	std::vector<vk::Image> imgs{};
 	std::vector<vk::UniqueImageView> img_views{};
-	std::vector<vk::UniqueSemaphore> semaphores{};
 	std::optional<u32> img_idx{};
 
 };
@@ -90,18 +89,17 @@ private:
 class Renderer {
 
 public:
-	explicit Renderer();
-	void draw(FramePacket* packet);
+	explicit Renderer(Window* win);
+	auto draw(FramePacket* packet) -> void;
 
 private:
 	struct RenderSync {
 		vk::CommandBuffer cmd;
-		vk::UniqueSemaphore available;
-		vk::UniqueSemaphore finished;
+		vk::UniqueSemaphore img_available;
+		vk::UniqueSemaphore render_done;
 		vk::UniqueFence drawn;
 	};
 
-	Window win{};
 	vk::UniqueInstance inst;
 	vk::UniqueSurfaceKHR surf;
 
