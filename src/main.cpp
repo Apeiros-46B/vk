@@ -1,10 +1,11 @@
-#include <SDL_video.h>
 #include <chrono>
 #include <iostream>
 #include <thread>
 
 #include <boost/lockfree/spsc_queue.hpp>
 #include <SDL.h>
+#include <SDL_video.h>
+#include <SDL_vulkan.h>
 
 #include "renderer.hpp"
 #include "sugar.hpp"
@@ -50,7 +51,7 @@ int main() {
 
 	SDL_Event ev;
 	auto t_prev = std::chrono::steady_clock::now();
-	auto win_sz = win.sz;
+	auto drawable_sz = win.sz;
 
 	while (true) {
 		while (SDL_PollEvent(&ev)) {
@@ -59,7 +60,7 @@ int main() {
 				case SDL_WINDOWEVENT:
 					switch (ev.window.type) {
 						case SDL_WINDOWEVENT_RESIZED:
-							SDL_GetWindowSize(win.inner, &win_sz.x, &win_sz.y);
+							SDL_Vulkan_GetDrawableSize(win.inner, &drawable_sz.x, &drawable_sz.y);
 							break;
 						default: break;
 					}
@@ -83,7 +84,7 @@ int main() {
 		ctx->packet = ctx->arena.alloc<FramePacket>();
 		ctx->packet->t = t_now.time_since_epoch().count();
 		ctx->packet->dt = dt.count();
-		ctx->packet->win_sz = win_sz;
+		ctx->packet->drawable_sz = drawable_sz;
 		// TODO: draw commands
 
 		render_queue.push(ctx);

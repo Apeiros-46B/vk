@@ -5,6 +5,7 @@
 #include <cstring>
 #include <iostream>
 #include <limits>
+#include <numbers>
 #include <optional>
 #include <stdexcept>
 
@@ -51,7 +52,7 @@ Window::Window() {
 	if (SDL_Init(SDL_INIT_VIDEO) != 0) {
 		throw std::runtime_error(SDL_GetError());
 	}
-	auto ptr = SDL_CreateWindow("vk", -1, -1, 800, 600, SDL_WINDOW_SHOWN | SDL_WINDOW_VULKAN);
+	auto ptr = SDL_CreateWindow("vk", -1, -1, 800, 600, SDL_WINDOW_SHOWN | SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
 	if (ptr == nullptr) {
 		throw std::runtime_error(SDL_GetError());
 	}
@@ -133,8 +134,15 @@ auto Swapchain::recreate(glm::ivec2 sz) -> bool {
 	}
 
 	this->img_views.clear();
+	this->img_views.reserve(views->size());
 	for (auto v : views.value()) {
 		this->img_views.push_back(vk::UniqueImageView{v, this->dev});
+	}
+
+	this->render_sems.clear();
+	this->render_sems.resize(this->imgs.size());
+	for (auto& semaphore : this->render_sems) {
+		semaphore = this->dev.createSemaphoreUnique({});
 	}
 
 	sz = get_size();
@@ -143,12 +151,13 @@ auto Swapchain::recreate(glm::ivec2 sz) -> bool {
 	return true;
 }
 
-auto Swapchain::present(vk::Queue qu, vk::Semaphore to_wait) -> bool {
+auto Swapchain::present(vk::Queue qu) -> bool {
 	if (!this->img_idx.has_value()) {
 		return true;
 	}
 
 	auto img_idx = this->img_idx.value();
+	auto to_wait = *this->render_sems.at(img_idx);
 	auto present_info = vk::PresentInfoKHR{}
 		.setSwapchains(*this->inner)
 		.setImageIndices(img_idx)
@@ -204,6 +213,10 @@ auto Swapchain::base_barrier() const -> vk::ImageMemoryBarrier2 {
 
 auto Swapchain::get_size() const -> glm::ivec2 {
 	return {this->cinfo.imageExtent.width, this->cinfo.imageExtent.height};
+}
+
+auto Swapchain::get_sem() const -> vk::Semaphore {
+	return *this->render_sems.at(this->img_idx.value());
 }
 
 Renderer::Renderer(Window* win) {
@@ -289,15 +302,12 @@ Renderer::Renderer(Window* win) {
 	auto fence_cinfo = vk::FenceCreateInfo{vk::FenceCreateFlagBits::eSignaled};
 	for (size_t i = 0u; i < cmd_bufs.size(); i++) {
 		this->render_sync[i].cmd = cmd_bufs[i];
-		this->render_sync[i].img_available = this->dev->createSemaphoreUnique({});
-		this->render_sync[i].render_done = this->dev->createSemaphoreUnique({});
+		this->render_sync[i].img_sem = this->dev->createSemaphoreUnique({});
 		this->render_sync[i].drawn = this->dev->createFenceUnique(fence_cinfo);
 	}
 }
 
 auto Renderer::draw(FramePacket* packet) -> void {
-	std::cout << packet->dt << std::endl;
-
 	auto i = this->img_idx % this->render_sync.size();
 	this->img_idx++;
 
@@ -305,23 +315,25 @@ auto Renderer::draw(FramePacket* packet) -> void {
 
 	auto res = this->dev->waitForFences(1, &sync->drawn.get(), true, 1'000'000'000);
 	require_success(res, "wait for fence failed");
-	res = this->dev->resetFences(1, &sync->drawn.get());
-	require_success(res, "reset fence failed");
 
-	auto img = this->swapchain->acq_next_img(sync->img_available.get());
+	auto img = this->swapchain->acq_next_img(sync->img_sem.get());
 	if (!img.has_value()) {
-		if (!this->swapchain->recreate(packet->win_sz)) {
+		if (!this->swapchain->recreate(packet->drawable_sz)) {
 			throw std::runtime_error("Failed to recreate swapchain");
 		}
 		return;
 	}
+
+	// image acquired, now reset the fence
+	res = this->dev->resetFences(1, &sync->drawn.get());
+	require_success(res, "reset fence failed");
 
 	sync->cmd.reset();
 
 	auto info = vk::CommandBufferBeginInfo{}.setFlags(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
 	sync->cmd.begin(info);
 
-	auto draw_barrier = swapchain->base_barrier()
+	auto draw_barrier = this->swapchain->base_barrier()
     .setSrcStageMask(vk::PipelineStageFlagBits2::eTopOfPipe)
     .setDstStageMask(vk::PipelineStageFlagBits2::eColorAttachmentOutput)
     .setSrcAccessMask(vk::AccessFlagBits2::eNone)
@@ -331,7 +343,7 @@ auto Renderer::draw(FramePacket* packet) -> void {
 	auto dep_info = vk::DependencyInfo{}.setImageMemoryBarriers(draw_barrier);
 	sync->cmd.pipelineBarrier2(dep_info);
 
-	auto value = sin(packet->t);
+	auto value = static_cast<flt>((sin(packet->t / 1'000'000'000.0 * std::numbers::pi) + 1.0) / 2.0);
 	auto color = vk::ClearColorValue{}.setFloat32({value, value, value, 1.0});
 	auto attach_info = vk::RenderingAttachmentInfo{}
 		.setImageView(img->img_view)
@@ -346,7 +358,7 @@ auto Renderer::draw(FramePacket* packet) -> void {
 	sync->cmd.beginRendering(render_info);
 	sync->cmd.endRendering();
 
-	auto present_barrier = swapchain->base_barrier()
+	auto present_barrier = this->swapchain->base_barrier()
     .setSrcStageMask(vk::PipelineStageFlagBits2::eColorAttachmentOutput)
     .setDstStageMask(vk::PipelineStageFlagBits2::eBottomOfPipe)
     .setSrcAccessMask(vk::AccessFlagBits2::eColorAttachmentWrite)
@@ -360,10 +372,10 @@ auto Renderer::draw(FramePacket* packet) -> void {
 
 	auto cmd_info = vk::CommandBufferSubmitInfo{sync->cmd};
 	auto wait_info = vk::SemaphoreSubmitInfo{}
-		.setSemaphore(sync->img_available.get())
+		.setSemaphore(sync->img_sem.get())
 		.setStageMask(vk::PipelineStageFlagBits2::eColorAttachmentOutput);
 	auto sig_info = vk::SemaphoreSubmitInfo{}
-		.setSemaphore(sync->render_done.get())
+		.setSemaphore(this->swapchain->get_sem())
 		.setStageMask(vk::PipelineStageFlagBits2::eColorAttachmentOutput);
 	auto submit_info = vk::SubmitInfo2{}
 		.setWaitSemaphoreInfos(wait_info)
@@ -372,5 +384,5 @@ auto Renderer::draw(FramePacket* packet) -> void {
 	res = this->qu.submit2(1, &submit_info, sync->drawn.get(), VULKAN_HPP_DEFAULT_DISPATCHER);
 	require_success(res, "failed to submit to queue");
 
-	swapchain->present(this->qu, sync->render_done.get());
+	this->swapchain->present(this->qu);
 }

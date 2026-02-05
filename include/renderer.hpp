@@ -22,7 +22,7 @@ struct DrawCommand {
 struct FramePacket {
 	flt t;
 	flt dt;
-	glm::ivec2 win_sz;
+	glm::ivec2 drawable_sz;
 	std::span<DrawCommand> commands;
 };
 
@@ -52,6 +52,7 @@ struct RenderTarget {
 	vk::Image img;
 	vk::ImageView img_view;
 	vk::Extent2D extent;
+	u32 img_idx;
 };
 
 // it is the user's responsibility to recreate the swapchain upon receiving false/None
@@ -66,15 +67,13 @@ public:
 	);
 
 	auto recreate(glm::ivec2 sz) -> bool;
-	auto present(vk::Queue qu, vk::Semaphore to_wait) -> bool;
+	auto present(vk::Queue qu) -> bool;
 	auto acq_next_img(vk::Semaphore to_sig) -> std::optional<RenderTarget>;
 	auto base_barrier() const -> vk::ImageMemoryBarrier2;
 	auto get_size() const -> glm::ivec2;
+	auto get_sem() const -> vk::Semaphore;
 
 private:
-	auto populate_imgs() -> void;
-	auto create_img_views() -> void;
-
 	GPU gpu;
 	vk::Device dev;
 	vk::SurfaceKHR surf;
@@ -82,6 +81,7 @@ private:
 	vk::UniqueSwapchainKHR inner;
 	std::vector<vk::Image> imgs{};
 	std::vector<vk::UniqueImageView> img_views{};
+	std::vector<vk::UniqueSemaphore> render_sems{}; // signalled when render done
 	std::optional<u32> img_idx{};
 
 };
@@ -95,8 +95,7 @@ public:
 private:
 	struct RenderSync {
 		vk::CommandBuffer cmd;
-		vk::UniqueSemaphore img_available;
-		vk::UniqueSemaphore render_done;
+		vk::UniqueSemaphore img_sem; // signalled when img acquired
 		vk::UniqueFence drawn;
 	};
 
