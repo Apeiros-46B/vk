@@ -24,6 +24,7 @@
 #include <vulkan/vulkan_structs.hpp>
 
 #include "sugar.hpp"
+#include "shader.hpp"
 
 VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
 
@@ -71,7 +72,7 @@ Window::~Window() {
 	SDL_Quit();
 }
 
-static auto needs_recreation(vk::Result res) -> bool {
+static bool needs_recreation(vk::Result res) {
 	switch (res) {
 		case vk::Result::eSuccess:
 		case vk::Result::eSuboptimalKHR:
@@ -94,7 +95,7 @@ Swapchain::Swapchain(
 	}
 }
 
-auto Swapchain::recreate(glm::ivec2 sz) -> bool {
+bool Swapchain::recreate(glm::ivec2 sz) {
 	if (sz.x <= 0 || sz.y <= 0) return false;
 
 	this->dev.waitIdle();
@@ -151,7 +152,7 @@ auto Swapchain::recreate(glm::ivec2 sz) -> bool {
 	return true;
 }
 
-auto Swapchain::present(vk::Queue qu) -> bool {
+bool Swapchain::present(vk::Queue qu) {
 	if (!this->img_idx.has_value()) {
 		return true;
 	}
@@ -269,7 +270,6 @@ Renderer::Renderer(Window* win) {
 	auto dev_ret = vkb::DeviceBuilder{vkb_phys}.build();
 	if (!dev_ret) throw std::runtime_error(dev_ret.error().message()); auto vkb_dev = dev_ret.value();
 	this->dev = vk::UniqueDevice{vkb_dev.device};
-	this->waiter = *this->dev;
 
 	auto graphics_queue_ret = vkb_dev.get_queue(vkb::QueueType::graphics);
 	if (!graphics_queue_ret) throw std::runtime_error("Failed to get graphics queue");
@@ -305,34 +305,148 @@ Renderer::Renderer(Window* win) {
 		this->render_sync[i].img_sem = this->dev->createSemaphoreUnique({});
 		this->render_sync[i].drawn = this->dev->createFenceUnique(fence_cinfo);
 	}
+
+	this->init_pipeline();
 }
 
-auto Renderer::draw(FramePacket* packet) -> void {
-	auto i = this->img_idx % this->render_sync.size();
-	this->img_idx++;
+Renderer::~Renderer() {
+	if (this->dev) {
+		this->dev->waitIdle();
+	}
+}
 
+void Renderer::draw(FramePacket* pkt) {
+	auto i = this->img_idx++ % this->render_sync.size();
 	auto sync = &this->render_sync[i];
+	auto img = this->acq_render_target(sync, pkt);
+	if (!img.has_value()) {
+		return;
+	}
 
+	sync->cmd.reset();
+
+	auto info = vk::CommandBufferBeginInfo{}
+		.setFlags(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
+	sync->cmd.begin(info);
+
+	this->transition_for_render(sync->cmd);
+	this->render(img.value(), sync->cmd, pkt);
+	this->transition_for_present(sync->cmd);
+
+	sync->cmd.end();
+
+	this->submit_and_present(sync);
+}
+
+// {{{ TODO CHECK
+void Renderer::init_pipeline() {
+	auto code = read_file("build/triangle.spv");
+	auto module = this->dev->createShaderModuleUnique({
+		{}, code.size(), reinterpret_cast<const u32*>(code.data())
+	});
+
+	// 3. Define Shader Stages
+	auto vert_stage = vk::PipelineShaderStageCreateInfo({}, vk::ShaderStageFlagBits::eVertex, *module, "vertexMain");
+	auto frag_stage = vk::PipelineShaderStageCreateInfo({}, vk::ShaderStageFlagBits::eFragment, *module, "fragmentMain");
+	auto shader_stages = std::array{vert_stage, frag_stage};
+
+	// 4. Vertex Input (Empty for now, we are hardcoding vertices in shader)
+	auto vertex_input = vk::PipelineVertexInputStateCreateInfo{};
+
+	// 5. Input Assembly (Triangles)
+	auto input_assembly = vk::PipelineInputAssemblyStateCreateInfo({}, vk::PrimitiveTopology::eTriangleList);
+
+	// 6. Viewport State (Dynamic)
+	// We only specify the COUNT here, because we use Dynamic State for the actual values
+	auto viewport_state = vk::PipelineViewportStateCreateInfo({}, 1, nullptr, 1, nullptr);
+
+	// 7. Rasterizer (Fill, Cull Back faces)
+	auto rasterizer = vk::PipelineRasterizationStateCreateInfo{}
+		.setPolygonMode(vk::PolygonMode::eFill)
+		.setCullMode(vk::CullModeFlagBits::eBack)
+		.setFrontFace(vk::FrontFace::eClockwise) // or eCounterClockwise depending on your math
+		.setLineWidth(1.0f);
+
+	// 8. Multisample (Disable MSAA for now)
+	auto multisample = vk::PipelineMultisampleStateCreateInfo{}.setRasterizationSamples(vk::SampleCountFlagBits::e1);
+
+	// 9. Color Blending (Standard Alpha Blend)
+	auto color_blend_attachment = vk::PipelineColorBlendAttachmentState{}
+		.setBlendEnable(true)
+		.setSrcColorBlendFactor(vk::BlendFactor::eSrcAlpha)
+		.setDstColorBlendFactor(vk::BlendFactor::eOneMinusSrcAlpha)
+		.setColorBlendOp(vk::BlendOp::eAdd)
+		.setSrcAlphaBlendFactor(vk::BlendFactor::eOne)
+		.setDstAlphaBlendFactor(vk::BlendFactor::eZero)
+		.setColorBlendOp(vk::BlendOp::eAdd)
+		.setColorWriteMask(vk::ColorComponentFlagBits::eR | vk::ColorComponentFlagBits::eG | vk::ColorComponentFlagBits::eB | vk::ColorComponentFlagBits::eA);
+
+	auto color_blend = vk::PipelineColorBlendStateCreateInfo{}.setAttachments(color_blend_attachment);
+
+	// 10. Pipeline Layout (Push constants, descriptors go here)
+	// Even if empty, it is required!
+	auto layout_info = vk::PipelineLayoutCreateInfo{};
+	this->pipeline_layout = this->dev->createPipelineLayoutUnique(layout_info);
+
+	// 11. Dynamic State (Crucial for Resizing)
+	auto dynamic_states = std::array{vk::DynamicState::eViewport, vk::DynamicState::eScissor};
+	auto dynamic_info = vk::PipelineDynamicStateCreateInfo{}.setDynamicStates(dynamic_states);
+
+	// =================================================================================
+	// 12. DYNAMIC RENDERING INFO (The Replacement for RenderPass)
+	// =================================================================================
+	// We must tell the pipeline exactly what image format it will be drawing to.
+	auto swap_format = this->swapchain->cinfo.imageFormat; // e.g., eB8G8R8A8Srgb
+
+	auto pipeline_rendering_info = vk::PipelineRenderingCreateInfo{}
+		.setColorAttachmentFormats(swap_format);
+	// .setDepthAttachmentFormat(...) // If you had a depth buffer
+
+	// 13. Create the Pipeline
+	auto pipeline_info = vk::GraphicsPipelineCreateInfo{}
+		.setPNext(&pipeline_rendering_info) // <--- CHAIN IT HERE
+		.setStages(shader_stages)
+		.setPVertexInputState(&vertex_input)
+		.setPInputAssemblyState(&input_assembly)
+		.setPViewportState(&viewport_state)
+		.setPRasterizationState(&rasterizer)
+		.setPMultisampleState(&multisample)
+		.setPColorBlendState(&color_blend)
+		.setPDynamicState(&dynamic_info)
+		.setLayout(*this->pipeline_layout)
+		.setRenderPass(nullptr); // <--- MUST BE NULL for Dynamic Rendering
+
+	auto result = this->dev->createGraphicsPipelineUnique(nullptr, pipeline_info);
+	if (result.result != vk::Result::eSuccess) {
+		throw std::runtime_error("Failed to create pipeline");
+	}
+	this->pipeline = std::move(result.value);
+}
+// }}}
+
+auto Renderer::acq_render_target(
+	RenderSync* sync,
+	FramePacket* pkt
+) -> std::optional<RenderTarget> {
 	auto res = this->dev->waitForFences(1, &sync->drawn.get(), true, 1'000'000'000);
 	require_success(res, "wait for fence failed");
 
 	auto img = this->swapchain->acq_next_img(sync->img_sem.get());
 	if (!img.has_value()) {
-		if (!this->swapchain->recreate(packet->drawable_sz)) {
+		if (!this->swapchain->recreate(pkt->drawable_sz)) {
 			throw std::runtime_error("Failed to recreate swapchain");
 		}
-		return;
+		return {};
 	}
 
-	// image acquired, now reset the fence
+	// image acquired, now it is safe to reset the fence
 	res = this->dev->resetFences(1, &sync->drawn.get());
 	require_success(res, "reset fence failed");
 
-	sync->cmd.reset();
+	return img;
+}
 
-	auto info = vk::CommandBufferBeginInfo{}.setFlags(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
-	sync->cmd.begin(info);
-
+void Renderer::transition_for_render(vk::CommandBuffer cmd) const {
 	auto draw_barrier = this->swapchain->base_barrier()
     .setSrcStageMask(vk::PipelineStageFlagBits2::eTopOfPipe)
     .setDstStageMask(vk::PipelineStageFlagBits2::eColorAttachmentOutput)
@@ -341,23 +455,53 @@ auto Renderer::draw(FramePacket* packet) -> void {
     .setOldLayout(vk::ImageLayout::eUndefined)
     .setNewLayout(vk::ImageLayout::eColorAttachmentOptimal);
 	auto dep_info = vk::DependencyInfo{}.setImageMemoryBarriers(draw_barrier);
-	sync->cmd.pipelineBarrier2(dep_info);
+	cmd.pipelineBarrier2(dep_info);
+}
 
-	auto value = static_cast<flt>((sin(packet->t / 1'000'000'000.0 * std::numbers::pi) + 1.0) / 2.0);
-	auto color = vk::ClearColorValue{}.setFloat32({value, value, value, 1.0});
+void Renderer::render(RenderTarget& img, vk::CommandBuffer cmd, FramePacket* pkt) {
+	auto color = vk::ClearColorValue{}.setFloat32({0.0, 0.0, 0.0, 1.0});
 	auto attach_info = vk::RenderingAttachmentInfo{}
-		.setImageView(img->img_view)
+		.setImageView(img.img_view)
 		.setImageLayout(vk::ImageLayout::eColorAttachmentOptimal)
 		.setClearValue(color)
 		.setLoadOp(vk::AttachmentLoadOp::eClear)
 		.setStoreOp(vk::AttachmentStoreOp::eStore);
 	auto render_info = vk::RenderingInfo{}
-		.setRenderArea({{0, 0}, img->extent})
+		.setRenderArea({{0, 0}, img.extent})
 		.setLayerCount(1)
 		.setColorAttachments(attach_info);
-	sync->cmd.beginRendering(render_info);
-	sync->cmd.endRendering();
+	cmd.beginRendering(render_info);
 
+	// {{{ TODO CHECK
+	// 2. Bind the Pipeline
+	cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *this->pipeline);
+
+	// 3. Set Dynamic States
+	// Since we declared these as Dynamic in the pipeline, we MUST set them now.
+	// This allows the window to resize without rebuilding the pipeline.
+	auto viewport = vk::Viewport{}
+		.setX(0.0f)
+		.setY(0.0f)
+		.setWidth(static_cast<float>(img.extent.width))
+		.setHeight(static_cast<float>(img.extent.height))
+		.setMinDepth(0.0f)
+		.setMaxDepth(1.0f);
+	cmd.setViewport(0, viewport);
+
+	auto scissor = vk::Rect2D{}
+		.setOffset({0, 0})
+		.setExtent(img.extent);
+	cmd.setScissor(0, scissor);
+
+	// 4. Draw
+	// VertexCount = 3, InstanceCount = 1, FirstVertex = 0, FirstInstance = 0
+	cmd.draw(3, 1, 0, 0);
+	// }}}
+
+	cmd.endRendering();
+}
+
+void Renderer::transition_for_present(vk::CommandBuffer cmd) const {
 	auto present_barrier = this->swapchain->base_barrier()
     .setSrcStageMask(vk::PipelineStageFlagBits2::eColorAttachmentOutput)
     .setDstStageMask(vk::PipelineStageFlagBits2::eBottomOfPipe)
@@ -365,11 +509,11 @@ auto Renderer::draw(FramePacket* packet) -> void {
     .setDstAccessMask(vk::AccessFlagBits2::eNone)
     .setOldLayout(vk::ImageLayout::eColorAttachmentOptimal)
     .setNewLayout(vk::ImageLayout::ePresentSrcKHR);
-	dep_info = vk::DependencyInfo{}.setImageMemoryBarriers(present_barrier);
-	sync->cmd.pipelineBarrier2(dep_info);
+	auto dep_info = vk::DependencyInfo{}.setImageMemoryBarriers(present_barrier);
+	cmd.pipelineBarrier2(dep_info);
+}
 
-	sync->cmd.end();
-
+void Renderer::submit_and_present(RenderSync* sync) {
 	auto cmd_info = vk::CommandBufferSubmitInfo{sync->cmd};
 	auto wait_info = vk::SemaphoreSubmitInfo{}
 		.setSemaphore(sync->img_sem.get())
@@ -381,7 +525,12 @@ auto Renderer::draw(FramePacket* packet) -> void {
 		.setWaitSemaphoreInfos(wait_info)
 		.setCommandBufferInfos(cmd_info)
 		.setSignalSemaphoreInfos(sig_info);
-	res = this->qu.submit2(1, &submit_info, sync->drawn.get(), VULKAN_HPP_DEFAULT_DISPATCHER);
+	auto res = this->qu.submit2(
+		1,
+		&submit_info,
+		sync->drawn.get(),
+		VULKAN_HPP_DEFAULT_DISPATCHER
+	);
 	require_success(res, "failed to submit to queue");
 
 	this->swapchain->present(this->qu);

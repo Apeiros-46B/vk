@@ -26,7 +26,7 @@ void render_loop(Window* win) {
 	while (is_running) {
 		FrameContext* ctx = nullptr;
 		if (render_queue.pop(ctx)) {
-			renderer.draw(ctx->packet);
+			renderer.draw(ctx->pkt);
 
 			// send arena back to main
 			while (!free_queue.push(ctx)) {
@@ -81,10 +81,10 @@ int main() {
 		}
 		ctx->arena.reset();
 
-		ctx->packet = ctx->arena.alloc<FramePacket>();
-		ctx->packet->t = t_now.time_since_epoch().count();
-		ctx->packet->dt = dt.count();
-		ctx->packet->drawable_sz = drawable_sz;
+		ctx->pkt = ctx->arena.alloc<FramePacket>();
+		ctx->pkt->t = t_now.time_since_epoch().count();
+		ctx->pkt->dt = dt.count();
+		ctx->pkt->drawable_sz = drawable_sz;
 		// TODO: draw commands
 
 		render_queue.push(ctx);

@@ -12,7 +12,6 @@
 #include <vulkan/vulkan_structs.hpp>
 
 #include "arena.hpp"
-#include "scoped.hpp"
 #include "sugar.hpp"
 
 struct DrawCommand {
@@ -28,7 +27,7 @@ struct FramePacket {
 
 struct FrameContext {
 	Arena arena;
-	FramePacket* packet = nullptr;
+	FramePacket* pkt = nullptr;
 	FrameContext() : arena(1024 * 1024) {}
 };
 
@@ -57,6 +56,7 @@ struct RenderTarget {
 
 // it is the user's responsibility to recreate the swapchain upon receiving false/None
 class Swapchain {
+	friend class Renderer;
 
 public:
 	explicit Swapchain(
@@ -66,8 +66,8 @@ public:
 		glm::ivec2 sz
 	);
 
-	auto recreate(glm::ivec2 sz) -> bool;
-	auto present(vk::Queue qu) -> bool;
+	bool recreate(glm::ivec2 sz);
+	bool present(vk::Queue qu);
 	auto acq_next_img(vk::Semaphore to_sig) -> std::optional<RenderTarget>;
 	auto base_barrier() const -> vk::ImageMemoryBarrier2;
 	auto get_size() const -> glm::ivec2;
@@ -90,7 +90,9 @@ class Renderer {
 
 public:
 	explicit Renderer(Window* win);
-	auto draw(FramePacket* packet) -> void;
+	~Renderer();
+
+	void draw(FramePacket* pkt);
 
 private:
 	struct RenderSync {
@@ -98,6 +100,14 @@ private:
 		vk::UniqueSemaphore img_sem; // signalled when img acquired
 		vk::UniqueFence drawn;
 	};
+
+	void init_pipeline();
+
+	auto acq_render_target(RenderSync* sync, FramePacket* pkt) -> std::optional<RenderTarget>;
+	void transition_for_render(vk::CommandBuffer cmd) const;
+	void render(RenderTarget& img, vk::CommandBuffer cmd, FramePacket* pkt);
+	void transition_for_present(vk::CommandBuffer cmd) const;
+	void submit_and_present(RenderSync* sync);
 
 	vk::UniqueInstance inst;
 	vk::UniqueSurfaceKHR surf;
@@ -112,7 +122,7 @@ private:
 	std::array<RenderSync, 2> render_sync{};
 	u64 img_idx{0};
 
-	// when destroying renderer, this waits until dev idle before destroying preceding fields
-	ScopedWaiter waiter;
+	vk::UniquePipelineLayout pipeline_layout;
+	vk::UniquePipeline pipeline;
 
 };
