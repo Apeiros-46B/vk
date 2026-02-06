@@ -1,11 +1,9 @@
 #include "renderer.hpp"
 
 #include <algorithm>
-#include <cmath>
 #include <cstring>
 #include <iostream>
 #include <limits>
-#include <numbers>
 #include <optional>
 #include <stdexcept>
 
@@ -54,6 +52,7 @@ Window::Window() {
 		throw std::runtime_error(SDL_GetError());
 	}
 	auto ptr = SDL_CreateWindow("vk", -1, -1, 800, 600, SDL_WINDOW_SHOWN | SDL_WINDOW_VULKAN | SDL_WINDOW_RESIZABLE);
+	// auto ptr = SDL_CreateWindow("vk", -1, -1, 800, 600, SDL_WINDOW_SHOWN | SDL_WINDOW_VULKAN);
 	if (ptr == nullptr) {
 		throw std::runtime_error(SDL_GetError());
 	}
@@ -221,6 +220,27 @@ auto Swapchain::get_sem() const -> vk::Semaphore {
 }
 
 Renderer::Renderer(Window* win) {
+	auto vkb_inst = this->init_inst(win);
+
+	auto surf_inner = VkSurfaceKHR{};
+	if (!SDL_Vulkan_CreateSurface(win->inner, *this->inst, &surf_inner)) {
+		throw std::runtime_error(SDL_GetError());
+	}
+	this->surf = vk::UniqueSurfaceKHR{surf_inner, *this->inst};
+
+	this->init_devs(vkb_inst);
+	this->swapchain.emplace(this->gpu, *this->dev, *this->surf, win->sz);
+	this->init_sync();
+	this->init_pipeline();
+}
+
+Renderer::~Renderer() {
+	if (this->dev) {
+		this->dev->waitIdle();
+	}
+}
+
+auto Renderer::init_inst(Window* win) -> vkb::Instance {
 	VULKAN_HPP_DEFAULT_DISPATCHER.init();
 
 	auto inst_builder = vkb::InstanceBuilder{}
@@ -242,12 +262,10 @@ Renderer::Renderer(Window* win) {
 	this->inst = vk::UniqueInstance{vkb_inst.instance};
 	VULKAN_HPP_DEFAULT_DISPATCHER.init(*this->inst);
 
-	auto surf_inner = VkSurfaceKHR{};
-	if (!SDL_Vulkan_CreateSurface(win->inner, *this->inst, &surf_inner)) {
-		throw std::runtime_error(SDL_GetError());
-	}
-	this->surf = vk::UniqueSurfaceKHR{surf_inner, *this->inst};
+	return vkb_inst;
+}
 
+void Renderer::init_devs(vkb::Instance vkb_inst) {
 	auto required_features = vk::PhysicalDeviceFeatures{}
 		.setFillModeNonSolid(true)
 		.setWideLines(true)
@@ -264,11 +282,17 @@ Renderer::Renderer(Window* win) {
 		.set_required_features(required_features)
 		.set_required_features_13(features13)
 		.select();
-	if (!phys_ret) throw std::runtime_error(phys_ret.error().message());
-	auto vkb_phys = phys_ret.value();
+	if (!phys_ret) {
+		throw std::runtime_error(phys_ret.error().message());
+	}
 
+	auto vkb_phys = phys_ret.value();
 	auto dev_ret = vkb::DeviceBuilder{vkb_phys}.build();
-	if (!dev_ret) throw std::runtime_error(dev_ret.error().message()); auto vkb_dev = dev_ret.value();
+	if (!dev_ret) {
+		throw std::runtime_error(dev_ret.error().message());
+	}
+
+	auto vkb_dev = dev_ret.value();
 	this->dev = vk::UniqueDevice{vkb_dev.device};
 
 	auto graphics_queue_ret = vkb_dev.get_queue(vkb::QueueType::graphics);
@@ -284,9 +308,9 @@ Renderer::Renderer(Window* win) {
 		.feats = vkb_phys.features,
 		.qu_fam_idx = queue_fam_ret.value()
 	};
+}
 
-	this->swapchain.emplace(this->gpu, *this->dev, *this->surf, win->sz);
-
+void Renderer::init_sync() {
 	auto cmd_pool_cinfo = vk::CommandPoolCreateInfo{}
 		.setFlags(vk::CommandPoolCreateFlagBits::eResetCommandBuffer)
 		.setQueueFamilyIndex(this->gpu.qu_fam_idx);
@@ -305,37 +329,6 @@ Renderer::Renderer(Window* win) {
 		this->render_sync[i].img_sem = this->dev->createSemaphoreUnique({});
 		this->render_sync[i].drawn = this->dev->createFenceUnique(fence_cinfo);
 	}
-
-	this->init_pipeline();
-}
-
-Renderer::~Renderer() {
-	if (this->dev) {
-		this->dev->waitIdle();
-	}
-}
-
-void Renderer::draw(FramePacket* pkt) {
-	auto i = this->img_idx++ % this->render_sync.size();
-	auto sync = &this->render_sync[i];
-	auto img = this->acq_render_target(sync, pkt);
-	if (!img.has_value()) {
-		return;
-	}
-
-	sync->cmd.reset();
-
-	auto info = vk::CommandBufferBeginInfo{}
-		.setFlags(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
-	sync->cmd.begin(info);
-
-	this->transition_for_render(sync->cmd);
-	this->render(img.value(), sync->cmd, pkt);
-	this->transition_for_present(sync->cmd);
-
-	sync->cmd.end();
-
-	this->submit_and_present(sync);
 }
 
 // {{{ TODO CHECK
@@ -345,12 +338,11 @@ void Renderer::init_pipeline() {
 		{}, code.size(), reinterpret_cast<const u32*>(code.data())
 	});
 
-	// 3. Define Shader Stages
 	auto vert_stage = vk::PipelineShaderStageCreateInfo({}, vk::ShaderStageFlagBits::eVertex, *module, "vertexMain");
 	auto frag_stage = vk::PipelineShaderStageCreateInfo({}, vk::ShaderStageFlagBits::eFragment, *module, "fragmentMain");
 	auto shader_stages = std::array{vert_stage, frag_stage};
 
-	// 4. Vertex Input (Empty for now, we are hardcoding vertices in shader)
+	// vertices hardcoded in shader for now
 	auto vertex_input = vk::PipelineVertexInputStateCreateInfo{};
 
 	// 5. Input Assembly (Triangles)
@@ -424,6 +416,29 @@ void Renderer::init_pipeline() {
 }
 // }}}
 
+void Renderer::draw(FramePacket* pkt) {
+	auto i = this->img_idx++ % this->render_sync.size();
+	auto sync = &this->render_sync[i];
+	auto img = this->acq_render_target(sync, pkt);
+	if (!img.has_value()) {
+		return;
+	}
+
+	sync->cmd.reset();
+
+	auto info = vk::CommandBufferBeginInfo{}
+		.setFlags(vk::CommandBufferUsageFlagBits::eOneTimeSubmit);
+	sync->cmd.begin(info);
+
+	this->transition_for_render(sync->cmd);
+	this->render(img.value(), sync->cmd, pkt);
+	this->transition_for_present(sync->cmd);
+
+	sync->cmd.end();
+
+	this->submit_and_present(sync);
+}
+
 auto Renderer::acq_render_target(
 	RenderSync* sync,
 	FramePacket* pkt
@@ -434,7 +449,7 @@ auto Renderer::acq_render_target(
 	auto img = this->swapchain->acq_next_img(sync->img_sem.get());
 	if (!img.has_value()) {
 		if (!this->swapchain->recreate(pkt->drawable_sz)) {
-			throw std::runtime_error("Failed to recreate swapchain");
+			throw std::runtime_error("failed to recreate swapchain");
 		}
 		return {};
 	}
@@ -482,8 +497,8 @@ void Renderer::render(RenderTarget& img, vk::CommandBuffer cmd, FramePacket* pkt
 	auto viewport = vk::Viewport{}
 		.setX(0.0f)
 		.setY(0.0f)
-		.setWidth(static_cast<float>(img.extent.width))
-		.setHeight(static_cast<float>(img.extent.height))
+		.setWidth(static_cast<flt>(img.extent.width))
+		.setHeight(static_cast<flt>(img.extent.height))
 		.setMinDepth(0.0f)
 		.setMaxDepth(1.0f);
 	cmd.setViewport(0, viewport);

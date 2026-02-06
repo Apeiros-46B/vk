@@ -1,12 +1,13 @@
 #pragma once
 
-#include <SDL_video.h>
 #include <array>
 #include <glm/ext/vector_uint2.hpp>
 #include <optional>
 #include <vector>
 
 #include <glm/ext/vector_int2.hpp>
+#include <SDL_video.h>
+#include <VkBootstrap.h>
 #include <vulkan/vulkan.hpp>
 #include <vulkan/vulkan_handles.hpp>
 #include <vulkan/vulkan_structs.hpp>
@@ -101,6 +102,9 @@ private:
 		vk::UniqueFence drawn;
 	};
 
+	auto init_inst(Window* win) -> vkb::Instance;
+	void init_devs(vkb::Instance vkb_inst);
+	void init_sync();
 	void init_pipeline();
 
 	auto acq_render_target(RenderSync* sync, FramePacket* pkt) -> std::optional<RenderTarget>;
