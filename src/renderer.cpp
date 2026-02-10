@@ -1,12 +1,16 @@
 #include "renderer.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cstddef>
 #include <cstring>
 #include <iostream>
 #include <limits>
 #include <optional>
 #include <stdexcept>
 
+#include <glm/ext/vector_float2.hpp>
+#include <glm/ext/vector_float3.hpp>
 #include <glm/ext/vector_int2.hpp>
 #include <glm/ext/vector_uint2.hpp>
 #include <SDL.h>
@@ -14,6 +18,7 @@
 #include <SDL_video.h>
 #include <SDL_vulkan.h>
 #include <VkBootstrap.h>
+#include <vector>
 #include <vulkan/vulkan.hpp>
 #include <vulkan/vulkan_core.h>
 #include <vulkan/vulkan_enums.hpp>
@@ -23,12 +28,46 @@
 
 #include "sugar.hpp"
 #include "shader.hpp"
+#include "vma.hpp"
 
 VULKAN_HPP_DEFAULT_DISPATCH_LOADER_DYNAMIC_STORAGE
 
 // use vulkan 1.3.0
 constexpr auto VK_VER = vk::makeApiVersion(0, 1, 3, 0);
 constexpr u32 MIN_IMGS = 3u;
+
+struct Vertex {
+	glm::vec2 pos;
+	glm::vec3 color;
+
+	static auto get_binding() -> vk::VertexInputBindingDescription {
+		auto ret = vk::VertexInputBindingDescription{}
+			.setBinding(0)
+			.setStride(sizeof(Vertex))
+			.setInputRate(vk::VertexInputRate::eVertex);
+		return ret;
+	}
+
+	static auto get_attr_descs() -> std::array<vk::VertexInputAttributeDescription, 2> {
+		return std::array{
+			vk::VertexInputAttributeDescription{}
+				.setBinding(0)
+				.setLocation(0)
+				.setFormat(vk::Format::eR32G32Sfloat)
+				.setOffset(offsetof(Vertex, pos)),
+			vk::VertexInputAttributeDescription{}
+				.setBinding(0)
+				.setLocation(1)
+				.setFormat(vk::Format::eR32G32B32Sfloat)
+				.setOffset(offsetof(Vertex, color)),
+		};
+	}
+};
+const std::vector<Vertex> verts = {
+	{{0.0, -0.5}, {1.0, 0.0, 0.0}},
+	{{0.5, 0.5}, {0.0, 1.0, 0.0}},
+	{{-0.5, 0.5}, {0.0, 0.0, 1.0}},
+};
 
 static constexpr auto QU_PRIOS = std::array{1.0f};
 static constexpr auto DEV_EXTS = std::array{VK_KHR_SWAPCHAIN_EXTENSION_NAME};
@@ -231,6 +270,9 @@ Renderer::Renderer(Window* win) {
 	this->init_devs(vkb_inst);
 	this->swapchain.emplace(this->gpu, *this->dev, *this->surf, win->sz);
 	this->init_sync();
+
+	this->alloc = VulkanAllocator(this->inst.get(), this->gpu.pdev, this->dev.get());
+
 	this->init_pipeline();
 }
 
@@ -331,7 +373,6 @@ void Renderer::init_sync() {
 	}
 }
 
-// {{{ TODO CHECK
 void Renderer::init_pipeline() {
 	auto code = read_file("build/triangle.spv");
 	auto module = this->dev->createShaderModuleUnique({
@@ -343,26 +384,24 @@ void Renderer::init_pipeline() {
 	auto shader_stages = std::array{vert_stage, frag_stage};
 
 	// vertices hardcoded in shader for now
-	auto vertex_input = vk::PipelineVertexInputStateCreateInfo{};
+	auto binding_desc = Vertex::get_binding();
+	auto attr_descs = Vertex::get_attr_descs();
+	auto vertex_input = vk::PipelineVertexInputStateCreateInfo{}
+		.setVertexBindingDescriptions(binding_desc)
+		.setVertexAttributeDescriptions(attr_descs);
 
-	// 5. Input Assembly (Triangles)
 	auto input_assembly = vk::PipelineInputAssemblyStateCreateInfo({}, vk::PrimitiveTopology::eTriangleList);
 
-	// 6. Viewport State (Dynamic)
-	// We only specify the COUNT here, because we use Dynamic State for the actual values
 	auto viewport_state = vk::PipelineViewportStateCreateInfo({}, 1, nullptr, 1, nullptr);
 
-	// 7. Rasterizer (Fill, Cull Back faces)
 	auto rasterizer = vk::PipelineRasterizationStateCreateInfo{}
 		.setPolygonMode(vk::PolygonMode::eFill)
 		.setCullMode(vk::CullModeFlagBits::eBack)
-		.setFrontFace(vk::FrontFace::eClockwise) // or eCounterClockwise depending on your math
+		.setFrontFace(vk::FrontFace::eClockwise)
 		.setLineWidth(1.0f);
 
-	// 8. Multisample (Disable MSAA for now)
 	auto multisample = vk::PipelineMultisampleStateCreateInfo{}.setRasterizationSamples(vk::SampleCountFlagBits::e1);
 
-	// 9. Color Blending (Standard Alpha Blend)
 	auto color_blend_attachment = vk::PipelineColorBlendAttachmentState{}
 		.setBlendEnable(true)
 		.setSrcColorBlendFactor(vk::BlendFactor::eSrcAlpha)
@@ -375,28 +414,20 @@ void Renderer::init_pipeline() {
 
 	auto color_blend = vk::PipelineColorBlendStateCreateInfo{}.setAttachments(color_blend_attachment);
 
-	// 10. Pipeline Layout (Push constants, descriptors go here)
-	// Even if empty, it is required!
 	auto layout_info = vk::PipelineLayoutCreateInfo{};
 	this->pipeline_layout = this->dev->createPipelineLayoutUnique(layout_info);
 
-	// 11. Dynamic State (Crucial for Resizing)
 	auto dynamic_states = std::array{vk::DynamicState::eViewport, vk::DynamicState::eScissor};
 	auto dynamic_info = vk::PipelineDynamicStateCreateInfo{}.setDynamicStates(dynamic_states);
 
-	// =================================================================================
-	// 12. DYNAMIC RENDERING INFO (The Replacement for RenderPass)
-	// =================================================================================
-	// We must tell the pipeline exactly what image format it will be drawing to.
-	auto swap_format = this->swapchain->cinfo.imageFormat; // e.g., eB8G8R8A8Srgb
+	auto swap_format = this->swapchain->cinfo.imageFormat;
 
 	auto pipeline_rendering_info = vk::PipelineRenderingCreateInfo{}
 		.setColorAttachmentFormats(swap_format);
 	// .setDepthAttachmentFormat(...) // If you had a depth buffer
 
-	// 13. Create the Pipeline
 	auto pipeline_info = vk::GraphicsPipelineCreateInfo{}
-		.setPNext(&pipeline_rendering_info) // <--- CHAIN IT HERE
+		.setPNext(&pipeline_rendering_info)
 		.setStages(shader_stages)
 		.setPVertexInputState(&vertex_input)
 		.setPInputAssemblyState(&input_assembly)
@@ -406,7 +437,7 @@ void Renderer::init_pipeline() {
 		.setPColorBlendState(&color_blend)
 		.setPDynamicState(&dynamic_info)
 		.setLayout(*this->pipeline_layout)
-		.setRenderPass(nullptr); // <--- MUST BE NULL for Dynamic Rendering
+		.setRenderPass(nullptr);
 
 	auto result = this->dev->createGraphicsPipelineUnique(nullptr, pipeline_info);
 	if (result.result != vk::Result::eSuccess) {
@@ -414,7 +445,6 @@ void Renderer::init_pipeline() {
 	}
 	this->pipeline = std::move(result.value);
 }
-// }}}
 
 void Renderer::draw(FramePacket* pkt) {
 	auto i = this->img_idx++ % this->render_sync.size();
@@ -463,12 +493,12 @@ auto Renderer::acq_render_target(
 
 void Renderer::transition_for_render(vk::CommandBuffer cmd) const {
 	auto draw_barrier = this->swapchain->base_barrier()
-    .setSrcStageMask(vk::PipelineStageFlagBits2::eTopOfPipe)
-    .setDstStageMask(vk::PipelineStageFlagBits2::eColorAttachmentOutput)
-    .setSrcAccessMask(vk::AccessFlagBits2::eNone)
-    .setDstAccessMask(vk::AccessFlagBits2::eColorAttachmentWrite)
-    .setOldLayout(vk::ImageLayout::eUndefined)
-    .setNewLayout(vk::ImageLayout::eColorAttachmentOptimal);
+		.setSrcStageMask(vk::PipelineStageFlagBits2::eTopOfPipe)
+		.setDstStageMask(vk::PipelineStageFlagBits2::eColorAttachmentOutput)
+		.setSrcAccessMask(vk::AccessFlagBits2::eNone)
+		.setDstAccessMask(vk::AccessFlagBits2::eColorAttachmentWrite)
+		.setOldLayout(vk::ImageLayout::eUndefined)
+		.setNewLayout(vk::ImageLayout::eColorAttachmentOptimal);
 	auto dep_info = vk::DependencyInfo{}.setImageMemoryBarriers(draw_barrier);
 	cmd.pipelineBarrier2(dep_info);
 }
@@ -487,13 +517,9 @@ void Renderer::render(RenderTarget& img, vk::CommandBuffer cmd, FramePacket* pkt
 		.setColorAttachments(attach_info);
 	cmd.beginRendering(render_info);
 
-	// {{{ TODO CHECK
-	// 2. Bind the Pipeline
 	cmd.bindPipeline(vk::PipelineBindPoint::eGraphics, *this->pipeline);
 
-	// 3. Set Dynamic States
-	// Since we declared these as Dynamic in the pipeline, we MUST set them now.
-	// This allows the window to resize without rebuilding the pipeline.
+	// set dynamic states
 	auto viewport = vk::Viewport{}
 		.setX(0.0f)
 		.setY(0.0f)
@@ -508,22 +534,19 @@ void Renderer::render(RenderTarget& img, vk::CommandBuffer cmd, FramePacket* pkt
 		.setExtent(img.extent);
 	cmd.setScissor(0, scissor);
 
-	// 4. Draw
-	// VertexCount = 3, InstanceCount = 1, FirstVertex = 0, FirstInstance = 0
 	cmd.draw(3, 1, 0, 0);
-	// }}}
 
 	cmd.endRendering();
 }
 
 void Renderer::transition_for_present(vk::CommandBuffer cmd) const {
 	auto present_barrier = this->swapchain->base_barrier()
-    .setSrcStageMask(vk::PipelineStageFlagBits2::eColorAttachmentOutput)
-    .setDstStageMask(vk::PipelineStageFlagBits2::eBottomOfPipe)
-    .setSrcAccessMask(vk::AccessFlagBits2::eColorAttachmentWrite)
-    .setDstAccessMask(vk::AccessFlagBits2::eNone)
-    .setOldLayout(vk::ImageLayout::eColorAttachmentOptimal)
-    .setNewLayout(vk::ImageLayout::ePresentSrcKHR);
+		.setSrcStageMask(vk::PipelineStageFlagBits2::eColorAttachmentOutput)
+		.setDstStageMask(vk::PipelineStageFlagBits2::eBottomOfPipe)
+		.setSrcAccessMask(vk::AccessFlagBits2::eColorAttachmentWrite)
+		.setDstAccessMask(vk::AccessFlagBits2::eNone)
+		.setOldLayout(vk::ImageLayout::eColorAttachmentOptimal)
+		.setNewLayout(vk::ImageLayout::ePresentSrcKHR);
 	auto dep_info = vk::DependencyInfo{}.setImageMemoryBarriers(present_barrier);
 	cmd.pipelineBarrier2(dep_info);
 }

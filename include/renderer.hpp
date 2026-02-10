@@ -14,6 +14,7 @@
 
 #include "arena.hpp"
 #include "sugar.hpp"
+#include "vma.hpp"
 
 struct DrawCommand {
 	// TODO
@@ -126,6 +127,7 @@ private:
 	std::array<RenderSync, 2> render_sync{};
 	u64 img_idx{0};
 
+	VulkanAllocator alloc;
 	vk::UniquePipelineLayout pipeline_layout;
 	vk::UniquePipeline pipeline;
 
